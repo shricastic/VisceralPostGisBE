@@ -1,6 +1,11 @@
 import express from "express";
 import cors from "cors";
 import { Pool } from "pg";
+import fs from "fs";
+import path from "path";
+
+const countryGeoJSONPath = path.join(__dirname, "../public/country.geo.json");
+const countryData = JSON.parse(fs.readFileSync(countryGeoJSONPath, "utf8"));
 
 const pool = new Pool({
   connectionString: "postgresql://postgres:postgres@localhost:5433/test_gis",
@@ -207,7 +212,7 @@ app.get("/polygons/:id", async (req, res) => {
   }
 });
 
-// Get stats endpoint - useful for monitoring
+// Get stats endpoint
 app.get("/stats", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -231,44 +236,263 @@ app.get("/stats", async (req, res) => {
   }
 });
 
-app.post("/states", async (req, res) => {
-  const { states } = req.body;
+app.post("/locations-geojson", async (req, res) => {
+  const { locations } = req.body;
 
-  if (!Array.isArray(states) || states.length === 0) {
-    return res.status(400).json({ error: "Need an array of state names" });
+  if (!Array.isArray(locations) || locations.length === 0) {
+    return res.status(400).json({ error: "Need an array of location names" });
   }
 
   try {
-    const result = await pool.query(
-      `SELECT gid, name, stusps, ST_AsGeoJSON(geom) AS geometry
-       FROM us_state
-       WHERE name = ANY($1)`,
-      [states],
-    );
+    const allFeatures = [];
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "No states found" });
+    for (const name of locations) {
+      let found = false;
+
+      // 1. First try countries (g_boundaries table)
+      // if (!found) {
+      //   try {
+      //     const countryResult = await pool.query(
+      //       `SELECT gid, name_en as name, iso_a2 as code, ST_AsGeoJSON(geom) AS geometry
+      //        FROM g_boundaries
+      //        WHERE LOWER(name_en) = LOWER($1)
+      //           OR LOWER(name) = LOWER($1)
+      //           OR LOWER(name_long) = LOWER($1)
+      //        LIMIT 1`,
+      //       [name],
+      //     );
+      //
+      //     if (countryResult.rows.length > 0) {
+      //       const row = countryResult.rows[0];
+      //       allFeatures.push({
+      //         type: "Feature",
+      //         properties: {
+      //           id: row.gid,
+      //           name: row.name,
+      //           code: row.code,
+      //           level: "country",
+      //         },
+      //         geometry: JSON.parse(row.geometry),
+      //       });
+      //       found = true;
+      //     }
+      //   } catch (err) {
+      //     console.log(`Country search failed for ${name}:`, err.message);
+      //   }
+      // }
+      if (!found) {
+        try {
+          const lowerName = name.toLowerCase();
+
+          const countryFeature =
+            countryData.features.find((f: any) => {
+              const props = f.properties || {};
+              const candidateNames = [
+                props.name,
+                props.name_en,
+                props.admin,
+                props.name_long,
+                props.brk_name,
+                props.name_sort,
+                props.abbrev,
+                props.postal,
+                props.formal_en,
+                props.iso_a2,
+                props.iso_a3,
+              ].filter(Boolean);
+
+              return candidateNames.some(
+                (n: string) => n.toLowerCase() === lowerName,
+              );
+            }) ||
+            countryData.features.find((f: any) => {
+              const props = f.properties || {};
+              const candidateNames = [
+                props.name,
+                props.name_en,
+                props.admin,
+                props.name_long,
+                props.brk_name,
+                props.name_sort,
+              ].filter(Boolean);
+
+              return candidateNames.some((n: string) =>
+                n.toLowerCase().includes(lowerName),
+              );
+            });
+
+          if (countryFeature) {
+            allFeatures.push({
+              type: "Feature",
+              properties: {
+                id:
+                  countryFeature.properties.iso_a3 ||
+                  countryFeature.properties.adm0_a3,
+                name:
+                  countryFeature.properties.name ||
+                  countryFeature.properties.admin ||
+                  countryFeature.properties.name_long,
+                code: countryFeature.properties.iso_a2,
+                level: "country",
+              },
+              geometry: countryFeature.geometry,
+            });
+            found = true;
+          }
+        } catch (err) {
+          console.log(
+            `Country search failed for ${name}:`,
+            (err as Error).message,
+          );
+        }
+      }
+
+      // 2. If not found in countries, try US states
+      if (!found) {
+        try {
+          const stateResult = await pool.query(
+            `SELECT gid, name, stusps, ST_AsGeoJSON(geom) AS geometry
+             FROM us_state 
+             WHERE LOWER(name) = LOWER($1) 
+                OR LOWER(stusps) = LOWER($1)
+             LIMIT 1`,
+            [name],
+          );
+
+          if (stateResult.rows.length > 0) {
+            const row = stateResult.rows[0];
+            allFeatures.push({
+              type: "Feature",
+              properties: {
+                id: row.gid,
+                name: row.name,
+                code: row.stusps,
+                level: "state",
+              },
+              geometry: JSON.parse(row.geometry),
+            });
+            found = true;
+          }
+        } catch (err) {
+          console.log(`State search failed for ${name}:`, err.message);
+        }
+      }
+
+      // 3. If not found in countries or states, try cities/places
+      if (!found) {
+        try {
+          const cityResult = await pool.query(
+            `SELECT gid, name, statefp, ST_AsGeoJSON(geom) AS geometry
+             FROM tiger.place 
+             WHERE LOWER(name) = LOWER($1)
+             LIMIT 1`,
+            [name],
+          );
+
+          if (cityResult.rows.length > 0) {
+            const row = cityResult.rows[0];
+            allFeatures.push({
+              type: "Feature",
+              properties: {
+                id: row.gid,
+                name: row.name,
+                state_fips: row.statefp,
+                level: "city",
+              },
+              geometry: JSON.parse(row.geometry),
+            });
+            found = true;
+          }
+        } catch (err) {
+          console.log(`City search failed for ${name}:`, err.message);
+        }
+      }
+
+      if (!found) {
+        try {
+          const urbanResult = await pool.query(
+            `SELECT gid, name, ST_AsGeoJSON(geom) AS geometry
+             FROM urban_areas 
+             WHERE LOWER(name) LIKE LOWER($1) || '%'
+             LIMIT 1`,
+            [name],
+          );
+
+          if (urbanResult.rows.length > 0) {
+            const row = urbanResult.rows[0];
+            allFeatures.push({
+              type: "Feature",
+              properties: {
+                id: row.gid,
+                name: row.name,
+                level: "urban_area",
+              },
+              geometry: JSON.parse(row.geometry),
+            });
+            found = true;
+          }
+        } catch (err) {
+          console.log(`Urban area search failed for ${name}:`, err.message);
+        }
+      }
+
+      if (!found) {
+        console.log(`Location not found: ${name}`);
+      }
     }
 
-    const features = result.rows.map((row) => ({
-      type: "Feature",
-      properties: {
-        id: row.gid,
-        name: row.name,
-        stusps: row.stusps,
-      },
-      geometry: JSON.parse(row.geometry),
-    }));
+    if (allFeatures.length === 0) {
+      return res.status(404).json({ error: "No locations found" });
+    }
 
     res.json({
       type: "FeatureCollection",
-      features,
+      features: allFeatures,
     });
   } catch (err) {
-    console.error("State fetch error:", err);
-    res.status(500).json({ error: "State fetch failed" });
+    console.error("Location search error:", err);
+    res.status(500).json({ error: "Location search failed" });
   }
 });
+
+// app.post("/states", async (req, res) => {
+//   const { states: names } = req.body;
+//
+//   if (!Array.isArray(names) || names.length === 0) {
+//     return res.status(400).json({ error: "Need an array of state names" });
+//   }
+//
+//   try {
+//     const result = await pool.query(
+//       `SELECT gid, name, stusps, ST_AsGeoJSON(geom) AS geometry
+//        FROM us_state
+//        WHERE name = ANY($1)`,
+//       [names],
+//     );
+//
+//     if (result.rows.length === 0) {
+//       return res.status(404).json({ error: "No states found" });
+//     }
+//
+//     const features = result.rows.map((row) => ({
+//       type: "Feature",
+//       properties: {
+//         id: row.gid,
+//         name: row.name,
+//         stusps: row.stusps,
+//       },
+//       geometry: JSON.parse(row.geometry),
+//     }));
+//
+//     res.json({
+//       type: "FeatureCollection",
+//       features,
+//     });
+//   } catch (err) {
+//     console.error("State fetch error:", err);
+//     res.status(500).json({ error: "State fetch failed" });
+//   }
+// });
 
 const PORT = 4000;
 app.listen(PORT, () => {
