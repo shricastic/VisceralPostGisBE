@@ -1,0 +1,106 @@
+-- Drop the existing table if it exists and recreate
+DROP TABLE IF EXISTS user_polygons CASCADE;
+
+-- Create the user_polygons table that can store GeometryCollections
+CREATE TABLE user_polygons (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL DEFAULT 'Drawing Set',
+    geom GEOMETRY(GEOMETRY, 4326) NOT NULL, -- Can store any geometry type including GeometryCollection
+    agent_id VARCHAR(50) NOT NULL,
+    user_id VARCHAR(50) NOT NULL,
+    properties JSONB DEFAULT '{}', -- Store metadata about all features in the collection
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indexes for better performance
+CREATE INDEX idx_user_polygons_geom ON user_polygons USING GIST(geom);
+CREATE INDEX idx_user_polygons_agent_user ON user_polygons(agent_id, user_id); -- Composite index
+CREATE INDEX idx_user_polygons_agent_id ON user_polygons(agent_id);
+CREATE INDEX idx_user_polygons_user_id ON user_polygons(user_id);
+CREATE INDEX idx_user_polygons_created_at ON user_polygons(created_at);
+
+-- Create a trigger to automatically update the updated_at column
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+CREATE TRIGGER update_user_polygons_updated_at 
+    BEFORE UPDATE ON user_polygons 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Add some sample data for testing
+INSERT INTO user_polygons (name, geom, agent_id, user_id, properties) VALUES 
+(
+    'Sample Drawing Set', 
+    ST_SetSRID(ST_GeomFromGeoJSON('{
+        "type": "GeometryCollection",
+        "geometries": [
+            {
+                "type": "Polygon",
+                "coordinates": [[[-98.5,39.5],[-98.0,39.5],[-98.0,40.0],[-98.5,40.0],[-98.5,39.5]]]
+            },
+            {
+                "type": "Point",
+                "coordinates": [-98.25, 39.75]
+            }
+        ]
+    }'), 4326),
+    '9401',
+    '157',
+    '{
+        "featureCount": 2,
+        "features": [
+            {"index": 0, "type": "Polygon", "properties": {"name": "Sample Rectangle"}},
+            {"index": 1, "type": "Point", "properties": {"name": "Sample Point"}}
+        ]
+    }'
+);
+
+-- Create a view for easier querying of individual geometries within collections
+CREATE OR REPLACE VIEW individual_geometries AS
+SELECT 
+    p.id as record_id,
+    p.name as record_name,
+    p.agent_id,
+    p.user_id,
+    p.created_at,
+    p.updated_at,
+    (p.properties->>'featureCount')::int as total_features,
+    ST_GeometryN(p.geom, generate_series(1, ST_NumGeometries(p.geom))) as individual_geom,
+    generate_series(1, ST_NumGeometries(p.geom)) as geometry_index
+FROM user_polygons p
+WHERE ST_GeometryType(p.geom) = 'ST_GeometryCollection';
+
+-- Function to get statistics about stored geometries
+CREATE OR REPLACE FUNCTION get_geometry_stats()
+RETURNS TABLE (
+    agent_id VARCHAR(50),
+    user_id VARCHAR(50),
+    total_records BIGINT,
+    total_individual_features BIGINT,
+    polygon_count BIGINT,
+    point_count BIGINT,
+    last_updated TIMESTAMP WITH TIME ZONE
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        p.agent_id,
+        p.user_id,
+        COUNT(*)::BIGINT as total_records,
+        SUM((p.properties->>'featureCount')::int)::BIGINT as total_individual_features,
+        SUM(CASE WHEN ST_GeometryType(ST_GeometryN(p.geom, g.n)) = 'ST_Polygon' THEN 1 ELSE 0 END)::BIGINT as polygon_count,
+        SUM(CASE WHEN ST_GeometryType(ST_GeometryN(p.geom, g.n)) = 'ST_Point' THEN 1 ELSE 0 END)::BIGINT as point_count,
+        MAX(p.updated_at) as last_updated
+    FROM user_polygons p
+    CROSS JOIN generate_series(1, GREATEST(ST_NumGeometries(p.geom), 1)) AS g(n)
+    WHERE ST_GeometryType(p.geom) = 'ST_GeometryCollection' 
+       OR ST_NumGeometries(p.geom) = 1
+    GROUP BY p.agent_id, p.user_id;
+END;
+$$ LANGUAGE plpgsql;

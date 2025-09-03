@@ -1,0 +1,2 @@
+node_modules/
+docker/restore/backup-db/compressed_dump.pgdump
