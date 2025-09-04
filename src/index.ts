@@ -38,7 +38,7 @@ app.post("/polygons", async (req, res) => {
       [agent_id, user_id],
     );
 
-    const result = await pool.query(
+    const insertResult = await pool.query(
       `
       INSERT INTO user_polygons (name, geom, agent_id, user_id, properties)
       VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326), $3, $4, $5)
@@ -53,9 +53,25 @@ app.post("/polygons", async (req, res) => {
       ],
     );
 
+    const polygonId = insertResult.rows[0].id;
+
+    // US states specific
+    const intersectingStateResult = await pool.query(
+      `
+      SELECT gid, name || ',United States' AS location, stusps
+      FROM us_state
+      WHERE ST_Intersects(
+        ST_SetSRID(geom, 4326),
+        (SELECT geom FROM user_polygons WHERE id = $1)
+      )
+      `,
+      [polygonId],
+    );
+
     res.json({
       status: "saved",
-      id: result.rows[0].id,
+      id: polygonId,
+      states: intersectingStateResult.rows,
       message: `Saved ${properties?.featureCount || 0} drawings in one record`,
     });
   } catch (err) {
